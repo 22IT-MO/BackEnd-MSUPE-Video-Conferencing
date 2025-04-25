@@ -19,7 +19,7 @@ def get_speaker_name(pyaudio_instance):
 
 def main():
     # Path to the model directory
-    model_path = "model/vosk-model-small-ru-0.22"
+    model_path = "model/vosk-model-ru-0.42"
     # Initialize model
     model = Model(model_path)
     # Create Recognizer, 16 kHz frequency

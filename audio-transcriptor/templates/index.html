@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Транскрипция лекции</title>
+    <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+
+    <style>
+      #status {
+        font-size: 1.2rem;
+        margin-bottom: 1rem;
+        font-weight: bold;
+        color: #555;
+      }
+      #status.loading {
+        color: orange;
+      }
+      #status.connected {
+        color: green;
+      }
+      #status.disconnected {
+        color: red;
+      }
+
+      button {
+        margin: 5px;
+        padding: 10px 20px;
+        font-size: 1rem;
+        border-radius: 10px;
+        border: none;
+        cursor: pointer;
+      }
+
+      button:disabled {
+        background-color: lightgray;
+        cursor: not-allowed;
+      }
+
+      #result {
+        margin-top: 20px;
+        white-space: pre-wrap;
+        font-family: monospace;
+        font-size: 1rem;
+        border: 1px solid #ccc;
+        padding: 10px;
+        border-radius: 10px;
+        min-height: 300px;
+        overflow-y: auto;
+        background: #f9f9f9;
+      }
+
+      .highlight {
+        background-color: #d1ffd1;
+        transition: background-color 0.5s;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="status" class="loading">⏳ Загрузка модели...</div>
+
+    <h1>Транскрипция лекции</h1>
+    <button id="start" disabled>Старт записи</button>
+    <button id="stop" disabled>Стоп записи</button>
+    <button id="download" disabled>Скачать транскрипт</button>
+
+    <div id="result"></div>
+
+    <script>
+      const socket = io();
+
+      const statusDiv = document.getElementById("status");
+      const startButton = document.getElementById("start");
+      const stopButton = document.getElementById("stop");
+      const downloadButton = document.getElementById("download");
+      const resultDiv = document.getElementById("result");
+
+      let recording = false;
+      let audioContext;
+      let processor;
+      let source;
+      let audioBuffer = [];
+      let liveParagraph = null;
+
+      socket.on("connect", function () {
+        console.log("✅ Socket.IO подключился!");
+      });
+
+      socket.on("server_message", function (data) {
+        statusDiv.innerText = "✅ " + data.message;
+        statusDiv.className = "connected";
+        startButton.disabled = false;
+        stopButton.disabled = false;
+        downloadButton.disabled = false;
+      });
+
+      socket.on("disconnect", function () {
+        statusDiv.innerText = "❌ Соединение потеряно!";
+        statusDiv.className = "disconnected";
+        startButton.disabled = true;
+        stopButton.disabled = true;
+        downloadButton.disabled = true;
+      });
+
+      socket.on("text", function (data) {
+        if (liveParagraph) {
+          liveParagraph.innerHTML = `<b>[${data.time}]</b> ${data.text}`;
+          liveParagraph.classList.remove("highlight");
+          liveParagraph = null;
+        } else {
+          const paragraph = document.createElement("div");
+          paragraph.innerHTML = `<b>[${data.time}]</b> ${data.text}`;
+          resultDiv.appendChild(paragraph);
+        }
+        resultDiv.scrollTop = resultDiv.scrollHeight;
+      });
+
+      socket.on("partial_text", function (data) {
+        if (!liveParagraph) {
+          liveParagraph = document.createElement("div");
+          liveParagraph.classList.add("highlight");
+          resultDiv.appendChild(liveParagraph);
+        }
+        liveParagraph.innerHTML = `<b>[${data.time}]</b> ${data.text}`;
+        resultDiv.scrollTop = resultDiv.scrollHeight;
+      });
+
+      document.getElementById("start").onclick = async () => {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          audio: true,
+        });
+
+        audioContext = new (window.AudioContext || window.webkitAudioContext)();
+        console.log("🎤 AudioContext sampleRate:", audioContext.sampleRate);
+
+        source = audioContext.createMediaStreamSource(stream);
+        processor = audioContext.createScriptProcessor(4096, 1, 1);
+
+        processor.onaudioprocess = (e) => {
+          if (!recording) return;
+          const inputData = e.inputBuffer.getChannelData(0);
+          const int16Array = floatTo16BitPCM(inputData);
+
+          audioBuffer.push(...int16Array);
+
+          if (audioBuffer.length >= 48000) {
+            const chunk = new Int16Array(audioBuffer);
+            socket.emit("audio", chunk.buffer);
+            audioBuffer = [];
+          }
+        };
+
+        source.connect(processor);
+        recording = true;
+        statusDiv.innerText = "🎙️ Идет запись...";
+        statusDiv.className = "connected";
+      };
+
+      document.getElementById("stop").onclick = () => {
+        recording = false;
+        if (processor) processor.disconnect();
+        if (source) source.disconnect();
+        if (audioContext) audioContext.close();
+        statusDiv.innerText = "⏹️ Запись остановлена";
+        socket.emit("stop");
+      };
+
+      document.getElementById("download").onclick = () => {
+        window.location.href = "/download";
+      };
+
+      function floatTo16BitPCM(input) {
+        const output = new Int16Array(input.length);
+        for (let i = 0; i < input.length; i++) {
+          let s = Math.max(-1, Math.min(1, input[i]));
+          output[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+        }
+        return output;
+      }
+    </script>
+  </body>
+</html>
