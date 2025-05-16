@@ -1,170 +1,154 @@
+import os
+import wave
+import datetime
 from flask import Flask, render_template, send_file
 from flask_socketio import SocketIO, emit
-from vosk import Model, KaldiRecognizer
-import numpy as np
-from scipy import signal
-import json
-import os
-import datetime
 from g4f.client import Client
+from g4f import Provider
+from faster_whisper import WhisperModel
 
-# Setting up Flask + SocketIO.
 app = Flask(__name__)
 socketio = SocketIO(app, cors_allowed_origins="*")
 
-# Path to the model.
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-MODEL_PATH = os.path.join(BASE_DIR, "models", "vosk-model-small-ru-0.22")
+TRANSCRIPTS_DIR = os.path.join(BASE_DIR, "transcripts")
+RAW_DIR = os.path.join(TRANSCRIPTS_DIR, "raw")
+CLEANED_DIR = os.path.join(TRANSCRIPTS_DIR, "cleaned")
+AUDIO_PATH = os.path.join(BASE_DIR, "lecture.wav")
+
+os.makedirs(TRANSCRIPTS_DIR, exist_ok=True)
+os.makedirs(RAW_DIR, exist_ok=True)
+os.makedirs(CLEANED_DIR, exist_ok=True)
+
+audio_buffer = bytearray()
+
+print("⏳ Loading faster-whisper model...")
+model = WhisperModel("small", device="cpu", compute_type="int8")
+print("✅ Model loaded.")
 
 
-# Buffer size threshold in bytes (e.g., 1 second of audio at 16kHz, 16-bit).
-BUFFER_THRESHOLD = 32000
-
-print("⏳ Loading model...")
-model = Model(MODEL_PATH)
-print("✅ Model loaded!")
-
-# Create a recognizer with 16kHz frequency.
-rec = KaldiRecognizer(model, 16000)
-
-# Buffer for accumulating lecture text.
-lecture_transcript = []
-
-# Buffer for accumulating the audio stream.
-full_audio_buffer = bytearray()
-current_text_start_time = None
-
-
-# Route to the main page.
 @app.route("/")
 def index():
     return render_template("index.html")
 
 
-# Route to download the ready transcript.
 @app.route("/download")
 def download_transcript():
-    timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    filename = f"transcript_of_{timestamp}.md"
-    path = os.path.join("transcripts", filename)
-
-    os.makedirs("transcripts", exist_ok=True)
-
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("# Lecture Transcript\n\n")
-        for entry in lecture_transcript:
-            f.write(f"**[{entry['time']}]** {entry['text']}\n\n")
-
-    return send_file(path, as_attachment=True)
+    files = sorted(
+        [f for f in os.listdir(RAW_DIR) if f.startswith("transcript_of_")],
+        reverse=True
+    )
+    if not files:
+        return "No transcript found", 404
+    return send_file(os.path.join(RAW_DIR, files[0]), as_attachment=True)
 
 
 @app.route("/download_cleaned")
-def download_cleaned_transcript():
+def download_cleaned():
     files = sorted(
-        [f for f in os.listdir("transcripts")
+        [f for f in os.listdir(CLEANED_DIR)
          if f.startswith("lecture_cleaned_")],
-        reverse=True,
+        reverse=True
     )
     if not files:
-        return "No cleaned transcripts available", 404
-    path = os.path.join("transcripts", files[0])
-    return send_file(path, as_attachment=True)
+        return "No cleaned transcript found", 404
+    return send_file(os.path.join(CLEANED_DIR, files[0]), as_attachment=True)
 
 
-def improve_transcript(raw_text):
-    client = Client()
-    content = f"Отформатируй этот транскрипт в связный конспект, добавь абзацы и пунктуацию. Игнорируй тайм-коды. Выдай сразу конспект:\n\n{raw_text}"
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": content}],
-        web_search=False,
-    )
-    return response.choices[0].message.content
-
-
-# Client connection handler.
 @socketio.on("connect")
 def handle_connect():
     print("🔌 Client connected")
-    emit("server_message", {"message": "Connection established!"})
+    socketio.emit("ready")
 
 
-# Audio reception handler.
 @socketio.on("audio")
 def handle_audio(data):
-    global full_audio_buffer, current_text_start_time
-
-    audio_bytes = data
-    audio_np = np.frombuffer(audio_bytes, dtype=np.int16)
-
-    number_of_samples = int(len(audio_np) * 16000 / 48000)
-    resampled = signal.resample(audio_np, number_of_samples)
-    resampled = resampled.astype(np.int16).tobytes()
-
-    full_audio_buffer += resampled
-
-    if len(full_audio_buffer) >= BUFFER_THRESHOLD:  # 1 second of audio.
-        if rec.AcceptWaveform(bytes(full_audio_buffer)):
-            result = json.loads(rec.Result())
-            text = result.get("text", "")
-            if text.strip():
-                # Use the fixed start time of speech.
-                if current_text_start_time is None:
-                    current_text_start_time = datetime.datetime.now().strftime(
-                        "%H:%M:%S"
-                    )
-                lecture_transcript.append(
-                    {"time": current_text_start_time, "text": text}
-                )
-                emit("text", {"text": text, "time": current_text_start_time})
-            current_text_start_time = None  # Reset after finishing the line.
-        else:
-            partial = json.loads(rec.PartialResult())
-            text = partial.get("partial", "")
-            if text.strip():
-                if current_text_start_time is None:
-                    current_text_start_time = datetime.datetime.now().strftime(
-                        "%H:%M:%S"
-                    )
-                emit("partial_text", {"text": text,
-                     "time": current_text_start_time})
-
-        full_audio_buffer = bytearray()
+    global audio_buffer
+    if data:
+        audio_buffer += data
 
 
-# Lecture stop handler.
 @socketio.on("stop")
 def handle_stop():
-    global lecture_transcript
+    global audio_buffer
 
-    print("🛑 Lecture stopped. Improving transcript...")
+    print("🛑 Received stop. Saving and transcribing...")
 
-    # Glue all text together.
-    full_text = "\n".join(
-        f"[{entry['time']}] {entry['text']}" for entry in lecture_transcript
-    )
+    with wave.open(AUDIO_PATH, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(48000)
+        wf.writeframes(audio_buffer)
 
-    # Generating improved text through ChatGPT.
-    improved_text = improve_transcript(full_text)
+    segments, info = model.transcribe(AUDIO_PATH)
+    full_text = "".join(segment.text for segment in segments)
 
-    # Saving.
-    timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    os.makedirs("transcripts", exist_ok=True)
-    path = os.path.join("transcripts", f"lecture_cleaned_{timestamp}.md")
+    ts = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    raw_path = os.path.join(RAW_DIR, f"transcript_of_{ts}.md")
+    with open(raw_path, "w", encoding="utf-8") as f:
+        f.write("# Транскрипт лекции\n\n")
+        f.write(full_text)
+    print("✅ Saved raw transcript.")
 
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("# Конспект лекции\n\n")
-        f.write(improved_text)
+    # Seek valid provider.
+    client = None
+    for provider in Provider.__providers__:
+        try:
+            print(f"🔍 Testing provider: {provider.__name__}")
+            temp_client = Client(provider=provider)
+            temp_response = temp_client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": "Проверка"}],
+                web_search=False
+            )
+            print(f"✅ Provider {provider.__name__} is working!")
+            client = temp_client
+            break
+        except Exception as e:
+            print(f"❌ Provider {provider.__name__} is not working!: {e}")
 
-    print("✅ Improved transcript saved!")
+    if not client:
+        print("❌ Cannot find a working GPT provider. GPT-processing is disabled.")
+
+    if client:
+        try:
+            gpt_prompt = (
+                f"Преобразуй транскрипт лекции в структурированный конспект "
+                f"с абзацами и пунктуацией. "
+                f"Учитывай, что лекция может содержать техническую и "
+                f"математическую терминологию, включая англоязычные слова, "
+                f"буквенные наименования и математические операторы (сумма, "
+                f"произведение, интеграл и т.д.). "
+                f"Нельзя добавлять новый текст от себя, за исключением случаев, "
+                f"когда очевидно, что пропущено какое-то слово (или несколько) "
+                f"из-за несовершенства технологии распознавания речи. "
+                f"Сразу выведи весь готовый текст. "
+                f"\nДалее идет транскрипт лекции:\n\n{full_text}"
+            )
+            response = client.chat.completions.create(
+                model="gpt-4o",
+                messages=[{"role": "user", "content": gpt_prompt}],
+                web_search=False
+            )
+            cleaned = response.choices[0].message.content
+            cleaned_path = os.path.join(
+                CLEANED_DIR, f"lecture_from_{ts}.md")
+            with open(cleaned_path, "w", encoding="utf-8") as f:
+                f.write("# Конспект лекции\n\n")
+                f.write(cleaned)
+            print("✅ Saved clean summary.")
+        except Exception as e:
+            print(f"⚠️ Error while generating summary: {e}")
+    else:
+        print("⚠️ Skipping summary generation — no available provider.")
+
+    audio_buffer = bytearray()
 
 
-# Client disconnection handler.
 @socketio.on("disconnect")
 def handle_disconnect():
     print("❌ Client disconnected")
 
 
-# Run server.
 if __name__ == "__main__":
-    socketio.run(app, host="0.0.0.0", port=5000, debug=True)
+    socketio.run(app, port=5000, debug=True)
