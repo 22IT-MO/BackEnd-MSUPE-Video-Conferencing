@@ -1,0 +1,6 @@
+flask
+flask-socketio
+vosk
+scipy
+numpy
+g4f[all]

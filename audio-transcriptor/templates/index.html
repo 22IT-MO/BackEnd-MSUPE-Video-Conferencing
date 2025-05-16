@@ -62,6 +62,7 @@
     <button id="start" disabled>Старт записи</button>
     <button id="stop" disabled>Стоп записи</button>
     <button id="download" disabled>Скачать транскрипт</button>
+    <button id="download-cleaned" disabled>📄 Скачать конспект</button>
 
     <div id="result"></div>
 
@@ -166,6 +167,10 @@
 
       document.getElementById("download").onclick = () => {
         window.location.href = "/download";
+      };
+
+      document.getElementById("download-cleaned").onclick = () => {
+        window.location.href = "/download_cleaned";
       };
 
       function floatTo16BitPCM(input) {

@@ -1,2 +1,3 @@
-audio-transcriptor/model/
+audio-transcriptor/models/
 audio-transcriptor/transcripts/
+venv/

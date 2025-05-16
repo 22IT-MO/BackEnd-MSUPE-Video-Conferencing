@@ -6,38 +6,42 @@ from scipy import signal
 import json
 import os
 import datetime
+from g4f.client import Client
 
-# Настройка Flask + SocketIO
+# Setting up Flask + SocketIO.
 app = Flask(__name__)
 socketio = SocketIO(app, cors_allowed_origins="*")
 
-# Путь к модели (замени на свой путь)
-MODEL_PATH = (
-    "model/vosk-model-small-ru-0.22"  # например "models/vosk-model-small-ru-0.22"
-)
+# Path to the model.
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MODEL_PATH = os.path.join(BASE_DIR, "models", "vosk-model-small-ru-0.22")
 
-print("⏳ Загружаем модель...")
+
+# Buffer size threshold in bytes (e.g., 1 second of audio at 16kHz, 16-bit).
+BUFFER_THRESHOLD = 32000
+
+print("⏳ Loading model...")
 model = Model(MODEL_PATH)
-print("✅ Модель загружена!")
+print("✅ Model loaded!")
 
-# Создаём распознаватель с частотой 16kHz
+# Create a recognizer with 16kHz frequency.
 rec = KaldiRecognizer(model, 16000)
 
-# Буфер для накопления текста лекции
+# Buffer for accumulating lecture text.
 lecture_transcript = []
 
-# Буфер для накопления аудио потока
+# Buffer for accumulating the audio stream.
 full_audio_buffer = bytearray()
 current_text_start_time = None
 
 
-# Маршрут на главную страницу
+# Route to the main page.
 @app.route("/")
 def index():
     return render_template("index.html")
 
 
-# Маршрут на скачивание готового транскрипта
+# Route to download the ready transcript.
 @app.route("/download")
 def download_transcript():
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -47,21 +51,45 @@ def download_transcript():
     os.makedirs("transcripts", exist_ok=True)
 
     with open(path, "w", encoding="utf-8") as f:
-        f.write("# Транскрипт лекции\n\n")
+        f.write("# Lecture Transcript\n\n")
         for entry in lecture_transcript:
-            f.write(f"**{entry['time']}** {entry['text']}\n\n")
+            f.write(f"**[{entry['time']}]** {entry['text']}\n\n")
 
     return send_file(path, as_attachment=True)
 
 
-# Обработчик подключения клиента
+@app.route("/download_cleaned")
+def download_cleaned_transcript():
+    files = sorted(
+        [f for f in os.listdir("transcripts")
+         if f.startswith("lecture_cleaned_")],
+        reverse=True,
+    )
+    if not files:
+        return "No cleaned transcripts available", 404
+    path = os.path.join("transcripts", files[0])
+    return send_file(path, as_attachment=True)
+
+
+def improve_transcript(raw_text):
+    client = Client()
+    content = f"Отформатируй этот транскрипт в связный конспект, добавь абзацы и пунктуацию. Игнорируй тайм-коды. Выдай сразу конспект:\n\n{raw_text}"
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": content}],
+        web_search=False,
+    )
+    return response.choices[0].message.content
+
+
+# Client connection handler.
 @socketio.on("connect")
 def handle_connect():
-    print("🔌 Клиент подключился")
-    emit("server_message", {"message": "Соединение установлено!"})
+    print("🔌 Client connected")
+    emit("server_message", {"message": "Connection established!"})
 
 
-# Обработчик принятия аудио
+# Audio reception handler.
 @socketio.on("audio")
 def handle_audio(data):
     global full_audio_buffer, current_text_start_time
@@ -75,12 +103,12 @@ def handle_audio(data):
 
     full_audio_buffer += resampled
 
-    if len(full_audio_buffer) >= 32000:  # 1 секунда аудио
+    if len(full_audio_buffer) >= BUFFER_THRESHOLD:  # 1 second of audio.
         if rec.AcceptWaveform(bytes(full_audio_buffer)):
             result = json.loads(rec.Result())
             text = result.get("text", "")
             if text.strip():
-                # Используем зафиксированное время начала речи
+                # Use the fixed start time of speech.
                 if current_text_start_time is None:
                     current_text_start_time = datetime.datetime.now().strftime(
                         "%H:%M:%S"
@@ -89,7 +117,7 @@ def handle_audio(data):
                     {"time": current_text_start_time, "text": text}
                 )
                 emit("text", {"text": text, "time": current_text_start_time})
-            current_text_start_time = None  # Сброс после завершения строки
+            current_text_start_time = None  # Reset after finishing the line.
         else:
             partial = json.loads(rec.PartialResult())
             text = partial.get("partial", "")
@@ -98,23 +126,45 @@ def handle_audio(data):
                     current_text_start_time = datetime.datetime.now().strftime(
                         "%H:%M:%S"
                     )
-                emit("partial_text", {"text": text, "time": current_text_start_time})
+                emit("partial_text", {"text": text,
+                     "time": current_text_start_time})
 
         full_audio_buffer = bytearray()
 
 
-# Обработчик окончания лекции
+# Lecture stop handler.
 @socketio.on("stop")
 def handle_stop():
-    print("🛑 Лекция остановлена. Транскрипция сохранена.")
+    global lecture_transcript
+
+    print("🛑 Lecture stopped. Improving transcript...")
+
+    # Glue all text together.
+    full_text = "\n".join(
+        f"[{entry['time']}] {entry['text']}" for entry in lecture_transcript
+    )
+
+    # Generating improved text through ChatGPT.
+    improved_text = improve_transcript(full_text)
+
+    # Saving.
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    os.makedirs("transcripts", exist_ok=True)
+    path = os.path.join("transcripts", f"lecture_cleaned_{timestamp}.md")
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("# Конспект лекции\n\n")
+        f.write(improved_text)
+
+    print("✅ Improved transcript saved!")
 
 
-# Обработчик отключения клиента
+# Client disconnection handler.
 @socketio.on("disconnect")
 def handle_disconnect():
-    print("❌ Клиент отключился")
+    print("❌ Client disconnected")
 
 
-# Запуск сервера
+# Run server.
 if __name__ == "__main__":
     socketio.run(app, host="0.0.0.0", port=5000, debug=True)
