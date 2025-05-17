@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <title>Транскрипция речи</title>
+  <script src="https://cdn.socket.io/4.0.1/socket.io.min.js"></script>
+</head>
+<body>
+  <h1>🎤 Транскрипт лекции</h1>
+
+  <button id="start" disabled>▶️ Старт записи</button>
+  <button id="stop" disabled>⏹️ Стоп записи</button>
+  <button id="download" disabled>📥 Скачать транскрипт</button>
+  <button id="download-cleaned" disabled>📄 Скачать конспект</button>
+
+  <div id="status">⏳ Загрузка модели...</div>
+  <div id="partial" style="font-style: italic; color: gray; margin-top: 1em;"></div>
+  <div id="text"></div>
+
+  <script>
+    const socket = io();
+    let audioContext;
+    let processor;
+    let recording = false;
+    const statusDiv = document.getElementById('status');
+    const textDiv = document.getElementById('text');
+
+    socket.on("ready", () => {
+      statusDiv.innerText = "✅ Готово к записи!";
+      document.getElementById("start").disabled = false;
+    });
+
+    document.getElementById('start').onclick = async () => {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+
+      audioContext = new AudioContext();
+      const source = audioContext.createMediaStreamSource(stream);
+
+      processor = audioContext.createScriptProcessor(4096, 1, 1);
+      processor.onaudioprocess = (e) => {
+        if (!recording) return;
+
+        const inputData = e.inputBuffer.getChannelData(0);
+        const int16Array = new Int16Array(inputData.length);
+        for (let i = 0; i < inputData.length; i++) {
+          int16Array[i] = inputData[i] * 0x7fff;
+        }
+        socket.emit('audio', int16Array.buffer);
+      };
+
+      source.connect(processor);
+      processor.connect(audioContext.destination);
+
+      recording = true;
+      document.getElementById('start').disabled = true;
+      document.getElementById('stop').disabled = false;
+      statusDiv.innerText = '🎙️ Идет запись...';
+    };
+
+    document.getElementById('stop').onclick = () => {
+      recording = false;
+      socket.emit('stop');
+      processor.disconnect();
+      audioContext.close();
+
+      document.getElementById('start').disabled = false;
+      document.getElementById('stop').disabled = true;
+      document.getElementById('download').disabled = false;
+      document.getElementById('download-cleaned').disabled = false;
+      statusDiv.innerText = '✅ Запись остановлена, транскрипт готов!';
+      document.getElementById('partial').innerText = '';
+    };
+
+    document.getElementById('download').onclick = () => {
+      window.location.href = '/download';
+    };
+
+    document.getElementById('download-cleaned').onclick = () => {
+      window.location.href = '/download_cleaned';
+    };
+
+    socket.on('text', (data) => {
+      const p = document.createElement('p');
+      p.innerHTML = `<b>[${data.time}]</b> ${data.text}`;
+      textDiv.appendChild(p);
+    });
+
+    socket.on('partial_text', (data) => {
+      document.getElementById("partial").innerText = `🗣 ${data.text}`;
+    });
+  </script>
+</body>
+</html>

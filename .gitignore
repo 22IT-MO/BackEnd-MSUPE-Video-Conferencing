@@ -1,0 +1,6 @@
+audio-transcriptor/deprecated/
+audio-transcriptor/transcripts/
+audio-transcriptor/lecture.wav
+generated_media
+har_and_cookies/
+venv/
